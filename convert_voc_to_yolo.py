@@ -11,14 +11,13 @@ import xml.etree.ElementTree as ET
 import random
 from collections import defaultdict
 
-# 路径配置
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VOC_DIR = os.path.join(BASE_DIR, "黑烟白烟1000数据集VOC", "1000数据集的voc")
-ANNOTATIONS_DIR = os.path.join(VOC_DIR, "Annotations")
-IMAGES_DIR = os.path.join(VOC_DIR, "JPEGImages")
-OUTPUT_LABELS_DIR = os.path.join(VOC_DIR, "labels_yolo")
-OUTPUT_IMAGES_DIR = os.path.join(BASE_DIR, "yolo_dataset", "images")
-OUTPUT_LABELS_YOLO_DIR = os.path.join(BASE_DIR, "yolo_dataset", "labels")
+# 路径配置 (所有路径相对于脚本所在目录)
+VOC_DIR = "黑烟白烟1000数据集VOC/1000数据集的voc"
+ANNOTATIONS_DIR = "黑烟白烟1000数据集VOC/1000数据集的voc/Annotations"
+IMAGES_DIR = "黑烟白烟1000数据集VOC/1000数据集的voc/JPEGImages"
+OUTPUT_LABELS_DIR = "黑烟白烟1000数据集VOC/1000数据集的voc/labels_yolo"
+OUTPUT_IMAGES_DIR = "yolo_dataset/images"
+OUTPUT_LABELS_YOLO_DIR = "yolo_dataset/labels"
 
 # 收集所有类别
 def collect_classes(annotations_dir):
@@ -202,7 +201,7 @@ def main():
 
     # 5. 生成dataset.yaml
     print("\n[5/5] 生成 dataset.yaml ...")
-    yaml_path = os.path.join(BASE_DIR, "yolo_dataset", "dataset.yaml")
+    yaml_path = "yolo_dataset/dataset.yaml"
     os.makedirs(os.path.dirname(yaml_path), exist_ok=True)
 
     # 生成train/val划分 (8:2)
@@ -249,7 +248,7 @@ def main():
 # 黑烟白烟检测数据集
 # 生成日期: 2026-06-16
 
-path: {os.path.join(BASE_DIR, 'yolo_dataset').replace(os.sep, '/')}
+path: ./yolo_dataset
 train: images/train
 val: images/val
 
@@ -268,7 +267,7 @@ names: {classes}
     # 最终汇总
     print("\n" + "=" * 60)
     print("转换完成!")
-    print(f"  输出目录: {os.path.join(BASE_DIR, 'yolo_dataset')}")
+    print(f"  输出目录: yolo_dataset/")
     print(f"  dataset.yaml: {yaml_path}")
     print("=" * 60)
 

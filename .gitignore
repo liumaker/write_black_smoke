@@ -1,0 +1,29 @@
+# 数据集（原始VOC）
+黑烟白烟1000数据集VOC/
+
+# YOLO格式数据集
+yolo_dataset/
+
+# 训练输出
+runs/
+
+# 转换工具输出
+convert_output.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系统
+.DS_Store
+Thumbs.db

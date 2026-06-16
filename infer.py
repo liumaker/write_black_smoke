@@ -22,15 +22,13 @@ COLORS = {
 
 
 def find_model():
-    """自动寻找最佳模型"""
-    candidates = list(Path.cwd().glob("runs/smoke_detection/weights/best.pt"))
+    """在 YOLO 默认输出路径下寻找最佳模型"""
+    candidates = list(Path("runs/train").rglob("weights/best.pt"))
     if not candidates:
-        candidates = list(Path.cwd().glob("runs/**/weights/best.pt"))
-    if not candidates:
-        print("[错误] 未找到模型文件 runs/**/weights/best.pt")
+        print("[错误] 未找到模型文件 runs/train/**/weights/best.pt")
         print("请先运行 train.py 训练模型")
         sys.exit(1)
-    return str(candidates[0])
+    return str(sorted(candidates)[-1])
 
 
 def draw_boxes(img, results, show_label=True, show_conf=True):
@@ -46,10 +44,8 @@ def draw_boxes(img, results, show_label=True, show_conf=True):
             label = CLASS_NAMES.get(cls_id, f"class_{cls_id}")
             color = COLORS.get(cls_id, (0, 255, 0))
 
-            # 绘制边框
             cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
-            # 绘制标签
             if show_label or show_conf:
                 text_parts = []
                 if show_label:
@@ -78,12 +74,10 @@ def infer_image(model, image_path, output_dir, conf_thres, show):
     img = cv2.imread(str(img_path))
     img = draw_boxes(img, results)
 
-    # 保存结果
     output_path = output_dir / img_path.name
     cv2.imwrite(str(output_path), img)
     print(f"  结果保存: {output_path}")
 
-    # 显示结果
     if show:
         cv2.imshow("Inference", img)
         cv2.waitKey(0)
@@ -180,16 +174,13 @@ def main():
                         help="不显示置信度")
     args = parser.parse_args()
 
-    # 模型加载
     model_path = args.model or find_model()
     print(f"加载模型: {model_path}")
     model = YOLO(model_path)
 
-    # 输出目录
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 推理源判断
     source = args.source
     if source is None:
         print("\n用法示例:")

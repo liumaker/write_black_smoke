@@ -7,42 +7,41 @@ from pathlib import Path
 from ultralytics import YOLO
 
 
-def validate():
-    BASE_DIR = Path(__file__).parent.resolve()
-    DATA_YAML = str(BASE_DIR / "yolo_dataset" / "dataset.yaml")
-
-    # 自动寻找最佳模型
-    candidates = list(BASE_DIR.glob("runs/smoke_detection/weights/best.pt"))
+def find_best_model():
+    """在 YOLO 默认输出路径下寻找最佳模型"""
+    candidates = list(Path("runs/train").rglob("weights/best.pt"))
     if not candidates:
-        # 尝试在同类目录下查找最近训练的模型
-        candidates = list(BASE_DIR.glob("runs/**/weights/best.pt"))
-
-    if not candidates:
-        print("[错误] 未找到训练好的模型 (runs/**/weights/best.pt)")
+        print("[错误] 未找到训练好的模型 (runs/train/**/weights/best.pt)")
         print("请先运行 train.py 训练模型")
         return None
+    # 取最新的模型
+    return str(sorted(candidates)[-1])
 
-    model_path = str(candidates[0])
+
+def validate():
+    DATA_YAML = "yolo_dataset/dataset.yaml"
+
+    model_path = find_best_model()
+    if model_path is None:
+        return None
+
     print(f"加载模型: {model_path}")
     print(f"数据集: {DATA_YAML}")
     print()
 
     model = YOLO(model_path)
 
+    # 不指定 project，使用 YOLO 默认路径 runs/val/exp...
     results = model.val(
         data=DATA_YAML,
         split="val",
         imgsz=640,
         batch=16,
         device="0" if __import__("torch").cuda.is_available() else "cpu",
-        project=str(BASE_DIR / "runs"),
-        name="smoke_validation",
-        exist_ok=True,
         conf=0.001,
         iou=0.6,
         max_det=300,
         save_json=True,
-        save_hybrid=False,
         verbose=True,
     )
 
@@ -57,13 +56,11 @@ def validate():
     if hasattr(results.box, "ap_class_index") and hasattr(results.box, "maps"):
         class_names = ['blacksmoke', 'whitesmoke', 'fire', 'smoke']
         print("\n  各类别 AP@0.5:")
-        for i, (cls_id, ap) in enumerate(zip(results.box.ap_class_index, results.box.maps)):
+        for cls_id, ap in zip(results.box.ap_class_index, results.box.maps):
             cls_name = class_names[cls_id] if cls_id < len(class_names) else f"class_{cls_id}"
             print(f"    {cls_name}: {ap:.4f}")
 
-    print(f"\n  结果保存至: runs/smoke_validation/")
     print("=" * 60)
-
     return results
 
 

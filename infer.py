@@ -311,8 +311,8 @@ def main():
     parser = argparse.ArgumentParser(description="黑烟白烟检测 - YOLO 推理/跟踪")
     parser.add_argument("source", type=str, nargs="?", default=None,
                         help="推理源: 图片路径/文件夹路径/视频路径/0(摄像头)")
-    parser.add_argument("--model", "-m", type=str, default=None,
-                        help="模型路径 (默认自动查找 best.pt)")
+    parser.add_argument("--model", "-m", type=str, default="./runs/detect/train/weights/best.pt",
+                        help="模型权重路径")
     parser.add_argument("--conf", "-c", type=float, default=0.25,
                         help="置信度阈值 (默认: 0.25)")
     parser.add_argument("--output", "-o", type=str, default="infer_results",
@@ -356,7 +356,9 @@ def main():
             print(f"  {name}: {t}")
         print(f"模型推理全局阈值: {model_conf}")
 
-    model_path = args.model or find_model()
+    model_path = args.model
+    if not Path(model_path).exists():
+        model_path = find_model()
     print(f"加载模型: {model_path}")
     model = YOLO(model_path)
 

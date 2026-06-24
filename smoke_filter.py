@@ -96,160 +96,339 @@ class RuleFilter:
 
 
 # ─────────────────────────────────────────────
-#  时序稳定模块  (抗抖动 / 闪烁)
+#  时序稳定模块  (防闪烁 / 去瞬时误检 / 提高报警可靠性)
 # ─────────────────────────────────────────────
 
 @dataclass
 class Tracklet:
-    """单个目标轨迹"""
+    """
+    单个目标轨迹。
+
+    核心设计:
+      - 置信度迟滞: 出现阈值 > 消失阈值，防止阈值边界闪烁
+      - 置信度衰减: 缺失帧时指数衰减，而非硬性计数
+      - 预热期: 新轨迹需累积足够证据才输出，滤除瞬时误检
+      - 可靠性评分: 综合 age、命中率、置信度稳定性，供报警使用
+    """
     cls_id: int
-    smoothed_box: list           # [x1, y1, x2, y2] 平滑后
-    smoothed_conf: float
-    age: int = 0                 # 连续看到的帧数
-    missing: int = 0             # 连续缺失帧数
-    alpha_box: float = 0.4       # 坐标EMA系数
-    alpha_conf: float = 0.3      # 置信度EMA系数
+    smoothed_box: list               # [x1, y1, x2, y2] EMA平滑后坐标
+    smoothed_conf: float             # EMA平滑后置信度
+    peak_conf: float                 # 历史最高置信度（记录证据强度）
+    age: int = 0                     # 累计命中帧数（含预热期）
+    consecutive_hits: int = 0        # 连续命中帧数（预热期计数器）
+    missing: int = 0                 # 连续缺失帧数
+    missing_conf_decay: float = 1.0  # 缺失帧时置信度衰减系数
+    is_confirmed: bool = False       # 是否通过预热期
+    hit_rate: float = 1.0            # 命中率 (age / total_frames_since_birth)
+    birth_frame: int = 0             # 创建时的帧号
+    alpha_box: float = 0.35          # 坐标EMA系数
+    alpha_conf: float = 0.25         # 置信度EMA系数
 
 
 class TemporalStabilizer:
     """
-    时序稳定器。
-    解决: smoke框乱跳、fire/smoke检测不稳定。
+    时序稳定器 —— 去瞬时误检、防闪烁、提高报警可靠性。
 
-    策略:
-      - EMA平滑框坐标和置信度
-      - 短生命周期检测抑制 (< min_hits 帧不显示)
-      - 缺失帧恢复 (最多容忍 miss_ttl 帧)
-      - 闪烁检测: 高频交替出现/消失时直接压制
+    三大设计目标:
+      1. 去瞬时误检: 新检测需经过预热期（连续命中 + 置信度积累）才输出
+      2. 防闪烁:     置信度迟滞 + EMA平滑 + 逐轨迹闪烁检测
+      3. 报警可靠性:  输出 reliability 评分（含时序稳定性因子）
+
+    核心策略:
+      - 置信度迟滞 (appear_thresh > disappear_thresh)
+      - 预热期: 连续命中 min_hits 帧、且累积置信度达标后才输出
+      - 缺失帧置信度指数衰减，衰减到阈值以下视为轨迹消亡
+      - 逐轨迹闪烁检测: 记录 status 翻转次数，高频翻转的轨迹被抑制
     """
 
-    def __init__(self, iou_thresh: float = 0.35,
-                 min_hits: int = 2,
-                 miss_ttl: int = 3,
-                 flicker_window: int = 8):
+    def __init__(self,
+                 iou_thresh: float = 0.30,
+                 appear_thresh: float = 0.35,
+                 disappear_thresh: float = 0.20,
+                 min_hits: int = 3,
+                 miss_ttl: int = 5,
+                 flicker_suppress_thresh: int = 4,
+                 flicker_window: int = 15):
         """
-        iou_thresh:    IoU匹配阈值(当前检测与历史轨迹)
-        min_hits:      最少连续命中帧数才显示
-        miss_ttl:      轨迹缺失后保留帧数
-        flicker_window:闪烁检测窗口
+        Args:
+            iou_thresh:       IoU匹配阈值
+            appear_thresh:    置信度出现阈值 — 超过此值才可能输出（防止低置信度误检）
+            disappear_thresh: 置信度消失阈值 — 低于此值才停止输出（防止闪烁消失）
+            min_hits:         预热期帧数 — 连续命中这么多帧、且置信度达标才输出
+            miss_ttl:         缺失保留帧数 — 轨迹丢失后保留的帧数
+            flicker_suppress_thresh: 闪烁抑制阈值 — status 翻转超过此值则压制
+            flicker_window:    闪烁检测窗口
         """
         self.iou_thresh = iou_thresh
+        self.appear_thresh = appear_thresh
+        self.disappear_thresh = disappear_thresh
         self.min_hits = min_hits
         self.miss_ttl = miss_ttl
+        self.flicker_suppress_thresh = flicker_suppress_thresh
         self.flicker_window = flicker_window
 
         self.tracks: list[Tracklet] = []
         self.frame_count = 0
-        self._flicker_counter = defaultdict(int)   # (cls_id,) -> 突变计数
+        # 逐轨迹闪烁检测器: track_id -> [status_history]
+        self._track_flicker: dict[int, list[int]] = defaultdict(list)
+
+    # ── 公开方法 ──────────────────────────
 
     def update(self, detections: list) -> list:
         """
-        输入: [(x1, y1, x2, y2, conf, cls_id), ...]
-        输出: 稳定后的列表
+        处理一帧检测结果。
+
+        Args:
+            detections: [(x1, y1, x2, y2, conf, cls_id), ...]
+
+        Returns:
+            [(x1, y1, x2, y2, conf, cls_id, reliability), ...]
+            其中 reliability ∈ [0,1]，表示时序可靠性，可用于报警决策。
         """
         self.frame_count += 1
         used_track_idx = set()
-        new_detections = []
+        alive_tracks = []
+        output = []
 
-        # ── 1. 将当前检测与已有轨迹匹配 ──
-        unmatched_det = list(detections)
-        for det in detections:
+        # ── 1. 匹配: 当前检测 → 已有轨迹 ──
+        matched_pairs = self._match_detections(detections)
+
+        for det_idx, track_idx in matched_pairs:
+            track = self.tracks[track_idx]
+            det = detections[det_idx]
             x1, y1, x2, y2, conf, cls_id = det
-            best_idx, best_iou = self._find_best_match(x1, y1, x2, y2, cls_id)
+            used_track_idx.add(track_idx)
 
-            if best_idx is not None and best_iou >= self.iou_thresh:
-                track = self.tracks[best_idx]
-                # EMA平滑框坐标
-                new_box = [x1, y1, x2, y2]
-                track.smoothed_box = [
-                    track.alpha_box * n + (1 - track.alpha_box) * o
-                    for n, o in zip(new_box, track.smoothed_box)
-                ]
-                # EMA平滑置信度
-                track.smoothed_conf = (
-                    track.alpha_conf * conf + (1 - track.alpha_conf) * track.smoothed_conf
-                )
-                track.age += 1
-                track.missing = 0
-                used_track_idx.add(best_idx)
-                unmatched_det.remove(det)
-            else:
-                # ── 2. 未匹配的检测 → 创建新轨迹 ──
-                # 先检查这个检测本身是否已经通过规则过滤
-                new_track = Tracklet(
-                    cls_id=cls_id,
-                    smoothed_box=[x1, y1, x2, y2],
-                    smoothed_conf=conf,
-                    age=1,
-                )
-                self.tracks.append(new_track)
+            # 更新框坐标 (EMA)
+            track.smoothed_box = [
+                track.alpha_box * n + (1 - track.alpha_box) * o
+                for n, o in zip([x1, y1, x2, y2], track.smoothed_box)
+            ]
+            # 更新置信度 (EMA)
+            track.smoothed_conf = (
+                track.alpha_conf * conf + (1 - track.alpha_conf) * track.smoothed_conf
+            )
+            # 更新峰值置信度
+            track.peak_conf = max(track.peak_conf, conf)
+            # 更新计数
+            track.consecutive_hits += 1
+            track.age += 1
+            track.missing = 0
+            track.missing_conf_decay = 1.0
+            # 预热期判定
+            if (track.consecutive_hits >= self.min_hits
+                    and track.smoothed_conf >= self.appear_thresh):
+                track.is_confirmed = True
 
-        # ── 3. 未匹配的旧轨迹: 增加missing计数 ──
+        # ── 2. 未匹配的旧轨迹: 缺失处理 ──
         for i, track in enumerate(self.tracks):
-            if i not in used_track_idx and track.age > 0:
-                track.missing += 1
+            if i not in used_track_idx:
+                if track.age > 0:
+                    track.missing += 1
+                    track.consecutive_hits = 0  # 连续命中中断
+                    # 置信度指数衰减 (每缺失一帧乘 0.7)
+                    track.missing_conf_decay *= 0.7
+                    track.smoothed_conf *= 0.7
+                    # 若已确认的轨迹，在 miss_ttl 内保留；未确认的轨迹直接丢弃
+                    if track.is_confirmed:
+                        if track.missing <= self.miss_ttl:
+                            alive_tracks.append(i)
+                    else:
+                        if track.missing <= 1:  # 未确认的只给1帧机会
+                            alive_tracks.append(i)
+                else:
+                    alive_tracks.append(i)
 
-        # ── 4. 清理过期轨迹 ──
-        self.tracks = [t for t in self.tracks
-                       if t.missing <= self.miss_ttl or t.age < self.min_hits]
+        # ── 3. 未匹配的当前检测 → 创建新轨迹 ──
+        used_det_idxs = {p[0] for p in matched_pairs}
+        for i, det in enumerate(detections):
+            if i in used_det_idxs:
+                continue
+            x1, y1, x2, y2, conf, cls_id = det
+            # 新检测置信度必须达到出现阈值的一半才有资格创建轨迹
+            # 避免极低置信度误检创建过多轨迹
+            if conf < self.appear_thresh * 0.5:
+                continue
+            new_track = Tracklet(
+                cls_id=cls_id,
+                smoothed_box=[x1, y1, x2, y2],
+                smoothed_conf=conf,
+                peak_conf=conf,
+                age=1,
+                consecutive_hits=1,
+                birth_frame=self.frame_count,
+            )
+            self.tracks.append(new_track)
+            alive_tracks.append(len(self.tracks) - 1)
 
-        # ── 5. 闪烁检测 ──
-        # 记录每个类别的活跃轨迹数变化，若高频抖动则压制
-        active_by_class = defaultdict(int)
-        for t in self.tracks:
-            if t.age >= self.min_hits and t.missing == 0:
-                active_by_class[t.cls_id] += 1
+        # ── 4. 清理已确认但未标记为 alive 的轨迹 ──
+        #    (这些是 matched 但未在步骤2标记的)
+        for i, track in enumerate(self.tracks):
+            if i in used_track_idx:
+                alive_tracks.append(i)
 
-        flicker_suppress = set()
-        for cls_id in (0, 1, 2, 3):
-            key = (cls_id,)
-            prev = self._flicker_counter[key]
-            curr = active_by_class.get(cls_id, 0)
-            if abs(curr - prev) >= 2:   # 活跃数突变
-                self._flicker_counter[key] += 1
-            else:
-                self._flicker_counter[key] = max(0, self._flicker_counter[key] - 1)
+        # ── 5. 逐轨迹闪烁检测 ──
+        #    记录每个轨迹的 visible/hidden 翻转次数
+        flicker_suppressed = set()
+        now_visible = set(alive_tracks)
+        for tid in now_visible:
+            hist = self._track_flicker[tid]
+            hist.append(1)
+            if len(hist) > self.flicker_window:
+                hist.pop(0)
+            # 统计翻转次数: 01 或 10 模式
+            flips = sum(1 for j in range(1, len(hist)) if hist[j] != hist[j-1])
+            if flips >= self.flicker_suppress_thresh:
+                flicker_suppressed.add(tid)
+        # 不在 visible 中的轨迹记录 0
+        for tid in list(self._track_flicker.keys()):
+            if tid not in now_visible:
+                hist = self._track_flicker[tid]
+                hist.append(0)
+                if len(hist) > self.flicker_window:
+                    hist.pop(0)
 
-            if self._flicker_counter[key] > self.flicker_window // 2:
-                flicker_suppress.add(cls_id)
+        # ── 6. 构建输出 ──
+        for i in alive_tracks:
+            track = self.tracks[i]
+            # 条件: 已确认 + 未闪烁抑制 + 平滑置信度 > 消失阈值
+            if not track.is_confirmed:
+                continue
+            if i in flicker_suppressed:
+                continue
+            if track.smoothed_conf < self.disappear_thresh:
+                continue
 
-        # ── 6. 输出稳定的检测结果 ──
-        for track in self.tracks:
-            if track.age >= self.min_hits and track.missing == 0:
-                if track.cls_id in flicker_suppress:
+            bx1, by1, bx2, by2 = track.smoothed_box
+            # 可靠性评分 (0~1, 越高越可靠)
+            reliability = self._compute_reliability(track)
+
+            output.append((
+                bx1, by1, bx2, by2,
+                track.smoothed_conf,
+                track.cls_id,
+                reliability,
+            ))
+
+        # ── 7. 最终清理: 移除过期轨迹 ──
+        self._cleanup()
+
+        return output
+
+    def _match_detections(self, detections: list) -> list[tuple]:
+        """
+        贪心匹配: 当前检测 → 已有轨迹，基于 IoU + 类别。
+        返回 [(det_idx, track_idx), ...]
+        """
+        matched = []
+        used_tracks = set()
+
+        # 按置信度降序处理检测（高置信度优先匹配）
+        scored_dets = sorted(
+            enumerate(detections),
+            key=lambda x: x[1][4],  # conf
+            reverse=True,
+        )
+
+        for det_idx, det in scored_dets:
+            x1, y1, x2, y2, conf, cls_id = det
+            best_iou = self.iou_thresh
+            best_track = None
+
+            for track_idx, track in enumerate(self.tracks):
+                if track_idx in used_tracks:
                     continue
-                bx1, by1, bx2, by2 = track.smoothed_box
-                new_detections.append(
-                    (bx1, by1, bx2, by2, track.smoothed_conf, track.cls_id)
-                )
+                if track.cls_id != cls_id:
+                    continue
+                if track.missing > self.miss_ttl:
+                    continue
 
-        return new_detections
+                tx1, ty1, tx2, ty2 = track.smoothed_box
+                iou = self._compute_iou(x1, y1, x2, y2, tx1, ty1, tx2, ty2)
+                # 对于已确认的轨迹，略微降低匹配门槛
+                if track.is_confirmed:
+                    iou *= 1.15
+                if iou > best_iou:
+                    best_iou = iou
+                    best_track = track_idx
 
-    def _find_best_match(self, x1, y1, x2, y2, cls_id):
-        """根据IoU寻找最佳匹配轨迹"""
-        best_iou = 0.0
-        best_idx = None
-        det_area = (x2 - x1) * (y2 - y1)
-        for i, track in enumerate(self.tracks):
-            if track.cls_id != cls_id:
-                continue
-            if track.missing > self.miss_ttl:
-                continue
-            tx1, ty1, tx2, ty2 = track.smoothed_box
-            # IoU计算
-            ix1, iy1 = max(x1, tx1), max(y1, ty1)
-            ix2, iy2 = min(x2, tx2), min(y2, ty2)
-            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-            track_area = (tx2 - tx1) * (ty2 - ty1)
-            union = det_area + track_area - inter
-            iou = inter / union if union > 0 else 0.0
-            if iou > best_iou:
-                best_iou = iou
-                best_idx = i
-        return best_idx, best_iou
+            if best_track is not None:
+                matched.append((det_idx, best_track))
+                used_tracks.add(best_track)
+
+        return matched
+
+    def _compute_reliability(self, track: Tracklet) -> float:
+        """
+        计算轨迹的时序可靠性评分 (0~1)，用于报警决策。
+
+        因子:
+          - age_factor:    累计命中帧数越多越可靠 (sigmoid-like)
+          - hit_rate:      命中率越高越可靠
+          - conf_stability: 峰值置信度与当前置信度的差距（差距小则稳定）
+          - miss_penalty:  缺失帧数惩罚
+        """
+        # age 因子: 年龄越大越可靠，5帧后趋于饱和
+        age_factor = 1.0 - 0.5 / (1.0 + track.age * 0.2)
+
+        # 命中率因子
+        total_frames = self.frame_count - track.birth_frame + 1
+        hit_rate = track.age / max(total_frames, 1)
+        hit_rate_factor = 0.3 + 0.7 * hit_rate
+
+        # 置信度稳定性: 峰值与当前值接近 = 稳定
+        if track.peak_conf > 0:
+            conf_ratio = track.smoothed_conf / track.peak_conf
+        else:
+            conf_ratio = 1.0
+        conf_stability = 0.5 + 0.5 * conf_ratio
+
+        # 缺失惩罚
+        miss_penalty = max(0.6, 1.0 - track.missing * 0.1)
+
+        reliability = (
+            age_factor * 0.35
+            + hit_rate_factor * 0.25
+            + conf_stability * 0.25
+            + miss_penalty * 0.15
+        )
+        return max(0.0, min(1.0, reliability))
+
+    def _compute_iou(self, ax1, ay1, ax2, ay2, bx1, by1, bx2, by2) -> float:
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        a_area = (ax2 - ax1) * (ay2 - ay1)
+        b_area = (bx2 - bx1) * (by2 - by1)
+        union = a_area + b_area - inter
+        return inter / union if union > 0 else 0.0
+
+    def _cleanup(self):
+        """移除过期轨迹"""
+        keep = []
+        for track in self.tracks:
+            if track.is_confirmed:
+                # 已确认轨迹: 允许 miss_ttl 帧缺失
+                if track.missing <= self.miss_ttl:
+                    keep.append(track)
+            else:
+                # 未确认轨迹: 
+                #   - 连续命中 < min_hits → 保留继续预热
+                #   - 但总帧数超过 2*min_hits 仍未确认 → 抛弃（证据不足）
+                if track.consecutive_hits < self.min_hits:
+                    if track.age < self.min_hits * 3:
+                        keep.append(track)
+        self.tracks = keep
+
+        # 清理闪烁记录中已不存在的轨迹
+        valid_ids = {id(t) for t in self.tracks}
+        self._track_flicker = {
+            tid: hist for tid, hist in self._track_flicker.items()
+            if tid in valid_ids
+        }
 
     def reset(self):
         """重置状态 (切换视频/场景时调用)"""
         self.tracks.clear()
         self.frame_count = 0
-        self._flicker_counter.clear()
+        self._track_flicker.clear()

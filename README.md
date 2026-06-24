@@ -67,38 +67,59 @@ filtered_boxes = rf.filter_boxes(raw_boxes)
 
 ---
 
-### 二、`TemporalStabilizer` — 时序稳定
+### 二、`TemporalStabilizer` — 时序稳定（去瞬时误检、防闪烁、提高报警可靠性）
 
-跨帧稳定模块，消除框抖动和闪烁，恢复短暂缺失的检测。
+跨帧稳定模块，解决检测框抖动、闪烁消失、单帧误检三大问题。
 
-#### 稳定策略
+#### 核心设计
 
-| 策略 | 参数 | 说明 |
+| 机制 | 参数 | 说明 |
 |------|------|------|
-| **EMA 坐标平滑** | `alpha_box=0.4` | 当前帧检测与历史轨迹加权平均，根除帧间坐标突变 |
-| **EMA 置信度平滑** | `alpha_conf=0.3` | 抑制单帧置信度突变导致的消失/出现 |
-| **生命周期过滤** | `min_hits=2` | 目标必须连续出现 ≥ 2 帧才输出，排除单帧误检 |
-| **缺失帧恢复** | `miss_ttl=3` | 已稳定的轨迹最多容忍 3 帧消失，恢复后继续显示 |
-| **闪烁检测** | `flicker_window=8` | 统计窗口内各类别活跃数突变频率，高频闪烁时自动压制 |
+| **置信度迟滞** | `appear_thresh=0.35` > `disappear_thresh=0.20` | 出现门槛高、消失门槛低，防止阈值边界处频繁闪烁 |
+| **预热期** | `min_hits=3` | 新检测必须连续命中 3 帧且置信度达标才输出，滤除单帧瞬时误检 |
+| **EMA 坐标平滑** | `alpha_box=0.35` | 当前帧与历史轨迹加权平均，消除坐标突变 |
+| **EMA 置信度平滑** | `alpha_conf=0.25` | 抑制置信度突变导致的消失/出现 |
+| **缺失帧指数衰减** | 每帧 ×0.7 | 轨迹丢失时置信度指数衰减，而非硬性计次，平滑过渡 |
+| **逐轨迹闪烁检测** | `flicker_window=15`, 翻转 ≥ 4 次则压制 | 独立跟踪每条轨迹的 visible/hidden 翻转次数，高频闪烁轨迹被压制 |
+| **可靠性评分** | 输出 `reliability ∈ [0,1]` | 综合年龄、命中率、置信度稳定性、缺失惩罚，供报警系统使用 |
 
-#### 工作原理
+#### 工作流程
 
-1. **匹配**：当前检测框与已有轨迹按 IoU + 类别进行匹配
-2. **更新**：匹配成功的轨迹用 EMA 更新坐标和置信度
-3. **创建**：未匹配的检测创建新轨迹（需累积够 min_hits 帧才输出）
-4. **过期**：超出 miss_ttl 帧未匹配的轨迹删除
-5. **闪烁抑制**：统计各类别轨迹数的突变次数，超过阈值后压制该类别输出
+```
+当前帧检测 → 贪心匹配(高置信度优先) → 匹配成功: EMA更新坐标/置信度
+                                    → 匹配失败: 置信度衰减 ×0.7
+新检测 → 置信度≥0.5×appear_thresh → 创建新轨迹(预热期)
+已确认轨迹缺失 → 置信度衰减 → 低于 disappear_thresh 则消亡
+逐轨迹闪烁检测 → 翻转次数超标 → 压制输出
+输出 → (x1,y1,x2,y2,conf,cls_id,reliability)
+```
+
+#### 报警可靠性评分
+
+每条输出轨迹附带 `reliability` 评分，由四项因子加权：
+
+| 因子 | 权重 | 说明 |
+|------|------|------|
+| age_factor | 35% | 累计命中帧数越多越可靠，5帧后趋于饱和 |
+| hit_rate_factor | 25% | 命中率越高越可靠 |
+| conf_stability | 25% | 当前置信度与峰值置信度的比值，波动小则可靠 |
+| miss_penalty | 15% | 缺失帧数惩罚，每缺失一帧扣 10% |
 
 #### 用法
 
 ```python
 from smoke_filter import TemporalStabilizer
 
-stabilizer = TemporalStabilizer(iou_thresh=0.35, min_hits=2, miss_ttl=3)
+stabilizer = TemporalStabilizer(
+    appear_thresh=0.35,      # 出现阈值
+    disappear_thresh=0.20,   # 消失阈值（迟滞防闪烁）
+    min_hits=3,              # 预热期帧数
+)
 
 for frame in video_frames:
-    raw_boxes = model(frame)  # 原始检测
-    stable_boxes = stabilizer.update(raw_boxes)  # 稳定后输出
+    raw_boxes = model(frame)
+    stable_boxes = stabilizer.update(raw_boxes)
+    # stable_boxes: [(x1,y1,x2,y2,conf,cls_id,reliability), ...]
 ```
 
 ---
@@ -114,6 +135,13 @@ for frame in video_frames:
 图片模式下仅启用规则过滤（单帧无需时序稳定）。
 
 使用 `--no-filter` 参数可关闭两个模块，便于对比效果。
+使用 `--show-reliability` 参数可在框下方显示可靠性评分。
+
+```bash
+python infer.py video.mp4                    # 默认启用滤波
+python infer.py --no-filter video.mp4        # 对比原始效果
+python infer.py --show-reliability video.mp4 # 显示可靠性评分
+```
 
 ## 数据集
 

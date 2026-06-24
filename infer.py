@@ -49,14 +49,21 @@ def _extract_boxes(results) -> list:
     return boxes_data
 
 
-def draw_filtered_boxes(img, boxes_data, show_label=True, show_conf=True, show_track_id=False):
-    """在图片上绘制滤波后的检测框"""
+def draw_filtered_boxes(img, boxes_data, show_label=True, show_conf=True,
+                        show_reliability=False, show_track_id=False):
+    """
+    在图片上绘制滤波后的检测框。
+
+    boxes_data 支持格式:
+      - 6元素: (x1, y1, x2, y2, conf, cls_id)
+      - 7元素: (x1, y1, x2, y2, conf, cls_id, reliability)
+    """
     for item in boxes_data:
         if len(item) == 6:
             x1, y1, x2, y2, conf, cls_id = item
-            track_id = None
+            reliability = None
         else:
-            x1, y1, x2, y2, conf, cls_id, track_id = item
+            x1, y1, x2, y2, conf, cls_id, reliability = item
 
         x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
         label = CLASS_NAMES.get(cls_id, f"class_{cls_id}")
@@ -64,21 +71,36 @@ def draw_filtered_boxes(img, boxes_data, show_label=True, show_conf=True, show_t
 
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
+        # 第一行: 类别 + 置信度
         text_parts = []
-        if show_track_id and track_id is not None:
-            text_parts.append(f"ID:{track_id}")
         if show_label:
             text_parts.append(label)
         if show_conf:
             text_parts.append(f"{conf:.2f}")
-        text = " ".join(text_parts)
+        text_line1 = " ".join(text_parts)
 
-        if text:
-            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        # 第二行: 可靠性 (供调试)
+        text_line2 = None
+        if show_reliability and reliability is not None:
+            text_line2 = f"rel:{reliability:.2f}"
+
+        # 绘制第一行
+        if text_line1:
+            (tw, th), _ = cv2.getTextSize(text_line1, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
             cv2.putText(
-                img, text, (x1 + 2, y1 - 4),
+                img, text_line1, (x1 + 2, y1 - 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+            )
+
+        # 绘制第二行 (显示在框下方)
+        if text_line2:
+            (tw2, th2), _ = cv2.getTextSize(text_line2, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            label_bottom = y2 + th2 + 6
+            cv2.rectangle(img, (x1, y2), (x1 + tw2 + 4, label_bottom), color, -1)
+            cv2.putText(
+                img, text_line2, (x1 + 2, y2 + th2 + 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
             )
     return img
 
@@ -114,7 +136,8 @@ def infer_image(model, image_path, output_dir, conf_thres, show, enable_filter):
 
 def infer_video(model, video_path, output_dir, conf_thres, show,
                 track=False, tracker="botsort.yaml",
-                enable_filter=True, enable_temporal=True):
+                enable_filter=True, enable_temporal=True,
+                show_reliability=False):
     """推理或跟踪视频文件"""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -162,7 +185,7 @@ def infer_video(model, video_path, output_dir, conf_thres, show,
         if stabilizer is not None:
             raw_boxes = stabilizer.update(raw_boxes)
 
-        frame = draw_filtered_boxes(frame, raw_boxes)
+        frame = draw_filtered_boxes(frame, raw_boxes, show_reliability=show_reliability)
         writer.write(frame)
 
         if show:
@@ -184,7 +207,7 @@ def infer_video(model, video_path, output_dir, conf_thres, show,
 
 
 def infer_webcam(model, conf_thres, show, track=False, tracker="botsort.yaml",
-                 enable_filter=True, enable_temporal=True):
+                 enable_filter=True, enable_temporal=True, show_reliability=False):
     """实时摄像头检测/跟踪"""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -218,7 +241,7 @@ def infer_webcam(model, conf_thres, show, track=False, tracker="botsort.yaml",
         if stabilizer is not None:
             raw_boxes = stabilizer.update(raw_boxes)
 
-        frame = draw_filtered_boxes(frame, raw_boxes)
+        frame = draw_filtered_boxes(frame, raw_boxes, show_reliability=show_reliability)
         cv2.imshow("Inference - Press 'q' to quit", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -250,10 +273,13 @@ def main():
                         help="不显示置信度")
     parser.add_argument("--no-filter", action="store_true",
                         help="关闭规则过滤和时序稳定 (原始检测)")
+    parser.add_argument("--show-reliability", action="store_true",
+                        help="显示时序可靠性评分 (框下方)")
     args = parser.parse_args()
 
     enable_filter = not args.no_filter
     enable_temporal = not args.no_filter
+    show_reliability = args.show_reliability
 
     model_path = args.model or find_model()
     print(f"加载模型: {model_path}")
@@ -284,7 +310,8 @@ def main():
     if source == "0" or source == "camera":
         infer_webcam(model, args.conf, args.show,
                      track=args.track, tracker=args.tracker,
-                     enable_filter=enable_filter, enable_temporal=enable_temporal)
+                     enable_filter=enable_filter, enable_temporal=enable_temporal,
+                     show_reliability=show_reliability)
     elif Path(source).is_dir():
         files = sorted(Path(source).glob("*"))
         for f in files:
@@ -294,7 +321,8 @@ def main():
     elif Path(source).suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
         infer_video(model, source, output_dir, args.conf, args.show,
                     track=args.track, tracker=args.tracker,
-                    enable_filter=enable_filter, enable_temporal=enable_temporal)
+                    enable_filter=enable_filter, enable_temporal=enable_temporal,
+                    show_reliability=show_reliability)
     else:
         infer_image(model, source, output_dir, args.conf, args.show,
                     enable_filter=enable_filter)

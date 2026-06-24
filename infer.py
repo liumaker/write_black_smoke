@@ -53,6 +53,25 @@ def _extract_boxes(results) -> list:
     return boxes_data
 
 
+def _filter_by_class_conf(boxes_data: list, cls_conf: list[float]) -> list:
+    """
+    按类别独立阈值过滤检测框。
+
+    Args:
+        boxes_data: [(x1,y1,x2,y2,conf,cls_id), ...]
+        cls_conf:   每个类别的置信度阈值，如 [0.25, 0.15, 0.25, 0.25]
+
+    Returns:
+        过滤后的检测框列表
+    """
+    kept = []
+    for x1, y1, x2, y2, conf, cls_id in boxes_data:
+        thresh = cls_conf[cls_id] if cls_id < len(cls_conf) else cls_conf[-1]
+        if conf >= thresh:
+            kept.append((x1, y1, x2, y2, conf, cls_id))
+    return kept
+
+
 def draw_filtered_boxes(img, boxes_data, show_label=True, show_conf=True,
                         show_reliability=False, show_track_id=False):
     """
@@ -109,24 +128,26 @@ def draw_filtered_boxes(img, boxes_data, show_label=True, show_conf=True,
     return img
 
 
-def infer_image(model, image_path, output_dir, conf_thres, show, enable_filter):
+def infer_image(model, image_path, output_dir, model_conf, show, enable_filter, cls_conf=None):
     """推理单张图片"""
     img_path = Path(image_path)
     if not img_path.exists():
         print(f"[跳过] 文件不存在: {image_path}")
         return
 
-    results = model(img_path, conf=conf_thres, iou=0.5)
+    results = model(img_path, conf=model_conf, iou=0.5)
     img = cv2.imread(str(img_path))
 
+    boxes_data = _extract_boxes(results)
+    if cls_conf is not None:
+        boxes_data = _filter_by_class_conf(boxes_data, cls_conf)
+
     if enable_filter:
-        boxes_data = _extract_boxes(results)
         h, w = img.shape[:2]
         rf = RuleFilter(h, w)
         boxes_data = rf.filter_boxes(boxes_data)
-        img = draw_filtered_boxes(img, boxes_data)
-    else:
-        img = draw_filtered_boxes(img, _extract_boxes(results))
+
+    img = draw_filtered_boxes(img, boxes_data)
 
     output_path = output_dir / img_path.name
     cv2.imwrite(str(output_path), img)
@@ -138,11 +159,12 @@ def infer_image(model, image_path, output_dir, conf_thres, show, enable_filter):
         cv2.destroyAllWindows()
 
 
-def infer_video(model, video_path, output_dir, conf_thres, show,
+def infer_video(model, video_path, output_dir, model_conf, show,
                 track=False, tracker="botsort.yaml",
                 enable_filter=True, enable_temporal=True,
-                show_reliability=False):
+                show_reliability=False, cls_conf=None):
     """推理或跟踪视频文件"""
+    video_path = Path(video_path)
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print(f"[错误] 无法打开视频: {video_path}")
@@ -171,14 +193,18 @@ def infer_video(model, video_path, output_dir, conf_thres, show,
         if not ret:
             break
 
-        # 原始检测/跟踪
+        # 原始检测/跟踪（使用全局最低阈值）
         if track:
-            results = model.track(frame, conf=conf_thres, iou=0.5, tracker=tracker, persist=True)
+            results = model.track(frame, conf=model_conf, iou=0.5, tracker=tracker, persist=True)
         else:
-            results = model(frame, conf=conf_thres, iou=0.5)
+            results = model(frame, conf=model_conf, iou=0.5)
 
         # 提取boxes
         raw_boxes = _extract_boxes(results)
+
+        # ── 按类别独立置信度过滤 ──
+        if cls_conf is not None:
+            raw_boxes = _filter_by_class_conf(raw_boxes, cls_conf)
 
         # ── 规则过滤 ──
         if enable_filter:
@@ -210,8 +236,9 @@ def infer_video(model, video_path, output_dir, conf_thres, show,
     print(f"结果保存: {output_path}")
 
 
-def infer_webcam(model, conf_thres, show, track=False, tracker="botsort.yaml",
-                 enable_filter=True, enable_temporal=True, show_reliability=False):
+def infer_webcam(model, model_conf, show, track=False, tracker="botsort.yaml",
+                 enable_filter=True, enable_temporal=True, show_reliability=False,
+                 cls_conf=None):
     """实时摄像头检测/跟踪"""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -232,11 +259,14 @@ def infer_webcam(model, conf_thres, show, track=False, tracker="botsort.yaml",
         h, w = frame.shape[:2]
 
         if track:
-            results = model.track(frame, conf=conf_thres, iou=0.5, tracker=tracker, persist=True)
+            results = model.track(frame, conf=model_conf, iou=0.5, tracker=tracker, persist=True)
         else:
-            results = model(frame, conf=conf_thres, iou=0.5)
+            results = model(frame, conf=model_conf, iou=0.5)
 
         raw_boxes = _extract_boxes(results)
+
+        if cls_conf is not None:
+            raw_boxes = _filter_by_class_conf(raw_boxes, cls_conf)
 
         if enable_filter:
             rf = RuleFilter(h, w)
@@ -279,11 +309,27 @@ def main():
                         help="关闭规则过滤和时序稳定 (原始检测)")
     parser.add_argument("--show-reliability", action="store_true",
                         help="显示时序可靠性评分 (框下方)")
+    parser.add_argument("--cls-conf", type=str, default=None,
+                        help="按类别设置独立置信度阈值，逗号分隔，如 0.25,0.15,0.25,0.25")
     args = parser.parse_args()
 
     enable_filter = not args.no_filter
     enable_temporal = not args.no_filter
     show_reliability = args.show_reliability
+
+    # 解析按类别阈值
+    cls_conf = None
+    model_conf = args.conf
+    if args.cls_conf:
+        cls_conf = [float(x.strip()) for x in args.cls_conf.split(",")]
+        # 模型推理使用所有类别中的最低阈值
+        model_conf = min(cls_conf)
+        cls_names = ['blacksmoke', 'whitesmoke', 'fire', 'smoke']
+        print("按类别阈值:")
+        for i, t in enumerate(cls_conf):
+            name = cls_names[i] if i < len(cls_names) else f"class_{i}"
+            print(f"  {name}: {t}")
+        print(f"模型推理全局阈值: {model_conf}")
 
     model_path = args.model or find_model()
     print(f"加载模型: {model_path}")
@@ -312,24 +358,24 @@ def main():
     print()
 
     if source == "0" or source == "camera":
-        infer_webcam(model, args.conf, args.show,
+        infer_webcam(model, model_conf, args.show,
                      track=args.track, tracker=args.tracker,
                      enable_filter=enable_filter, enable_temporal=enable_temporal,
-                     show_reliability=show_reliability)
+                     show_reliability=show_reliability, cls_conf=cls_conf)
     elif Path(source).is_dir():
         files = sorted(Path(source).glob("*"))
         for f in files:
             if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp"):
-                infer_image(model, f, output_dir, args.conf, args.show,
-                            enable_filter=enable_filter)
+                infer_image(model, f, output_dir, model_conf, args.show,
+                            enable_filter=enable_filter, cls_conf=cls_conf)
     elif Path(source).suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
-        infer_video(model, source, output_dir, args.conf, args.show,
+        infer_video(model, source, output_dir, model_conf, args.show,
                     track=args.track, tracker=args.tracker,
                     enable_filter=enable_filter, enable_temporal=enable_temporal,
-                    show_reliability=show_reliability)
+                    show_reliability=show_reliability, cls_conf=cls_conf)
     else:
-        infer_image(model, source, output_dir, args.conf, args.show,
-                    enable_filter=enable_filter)
+        infer_image(model, source, output_dir, model_conf, args.show,
+                    enable_filter=enable_filter, cls_conf=cls_conf)
 
 
 if __name__ == "__main__":

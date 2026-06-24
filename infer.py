@@ -185,8 +185,9 @@ def infer_video(model, video_path, output_dir, model_conf, show,
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
-    # 时序稳定器 (跨帧)
-    stabilizer = TemporalStabilizer() if enable_temporal else None
+    # 时序稳定器 (跨帧) — miss_ttl 按 fps 动态计算（默认 0.75s）
+    miss_ttl = max(5, int(fps * 0.75))
+    stabilizer = TemporalStabilizer(miss_ttl=miss_ttl) if enable_temporal else None
     # 颜色修正器
     color_corrector = ColorCorrector() if enable_color else None
 
@@ -194,7 +195,7 @@ def infer_video(model, video_path, output_dir, model_conf, show,
     frame_idx = 0
     print(f"视频信息: {w}x{h}, {fps}fps, {total}帧")
     print(f"{mode_str}中... (按 'q' 退出, 按 's' 暂停)")
-    print(f"  规则过滤: {'开' if enable_filter else '关'} | 颜色修正: {'开' if enable_color else '关'} | 时序稳定: {'开' if enable_temporal else '关'}")
+    print(f"  规则过滤: {'开' if enable_filter else '关'} | 颜色修正: {'开' if enable_color else '关'} | 时序稳定: {'开' if enable_temporal else '关'} (miss_ttl={miss_ttl}帧)")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -257,7 +258,12 @@ def infer_webcam(model, model_conf, show, track=False, tracker="botsort.yaml",
         print("[错误] 无法打开摄像头")
         return
 
-    stabilizer = TemporalStabilizer() if enable_temporal else None
+    cam_fps = cap.get(cv2.CAP_PROP_FPS)
+    if cam_fps <= 0:
+        cam_fps = 30
+    miss_ttl = max(5, int(cam_fps * 0.75))
+
+    stabilizer = TemporalStabilizer(miss_ttl=miss_ttl) if enable_temporal else None
     color_corrector = ColorCorrector() if enable_color else None
     mode_str = "跟踪" if track else "检测"
 

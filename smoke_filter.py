@@ -272,7 +272,8 @@ class TemporalStabilizer:
         flicker_suppressed = set()
         now_visible = set(alive_tracks)
         for tid in now_visible:
-            hist = self._track_flicker[tid]
+            track = self.tracks[tid]
+            hist = self._track_flicker[id(track)]
             hist.append(1)
             if len(hist) > self.flicker_window:
                 hist.pop(0)
@@ -281,9 +282,12 @@ class TemporalStabilizer:
             if flips >= self.flicker_suppress_thresh:
                 flicker_suppressed.add(tid)
         # 不在 visible 中的轨迹记录 0
-        for tid in list(self._track_flicker.keys()):
-            if tid not in now_visible:
-                hist = self._track_flicker[tid]
+        for track in self.tracks:
+            if id(track) not in self._track_flicker:
+                continue
+            hist = self._track_flicker[id(track)]
+            actual_visible = self.tracks.index(track) in now_visible
+            if not actual_visible:
                 hist.append(0)
                 if len(hist) > self.flicker_window:
                     hist.pop(0)

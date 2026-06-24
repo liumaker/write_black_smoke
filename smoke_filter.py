@@ -424,12 +424,12 @@ class TemporalStabilizer:
                         keep.append(track)
         self.tracks = keep
 
-        # 清理闪烁记录中已不存在的轨迹
+        # 清理闪烁记录中已不存在的轨迹，保持 defaultdict 类型
         valid_ids = {id(t) for t in self.tracks}
-        self._track_flicker = {
+        self._track_flicker = defaultdict(list, {
             tid: hist for tid, hist in self._track_flicker.items()
             if tid in valid_ids
-        }
+        })
 
     def reset(self):
         """重置状态 (切换视频/场景时调用)"""

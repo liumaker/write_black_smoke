@@ -1,6 +1,7 @@
 """
-黑烟白烟检测 - YOLO 推理脚本
-支持单张图片、图片文件夹、视频、摄像头
+黑烟白烟检测 - YOLO 推理/跟踪脚本
+支持单张图片、图片文件夹、视频、摄像头、目标跟踪
+集成规则过滤 + 时序稳定模块
 """
 
 import argparse
@@ -8,7 +9,10 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 from ultralytics import YOLO
+
+from smoke_filter import RuleFilter, TemporalStabilizer
 
 # 类别配置 (与训练时保持一致)
 CLASS_NAMES = {0: "blacksmoke", 1: "whitesmoke", 2: "fire", 3: "smoke"}
@@ -31,39 +35,55 @@ def find_model():
     return str(sorted(candidates)[-1])
 
 
-def draw_boxes(img, results, show_label=True, show_conf=True):
-    """在图片上绘制检测框"""
+def _extract_boxes(results) -> list:
+    """从 ultralytics Results 中提取 (x1,y1,x2,y2,conf,cls_id)"""
+    boxes_data = []
     for result in results:
-        boxes = result.boxes
-        if boxes is None:
+        if result.boxes is None or len(result.boxes) == 0:
             continue
-        for box in boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cls_id = int(box.cls[0])
+        for box in result.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
             conf = float(box.conf[0])
-            label = CLASS_NAMES.get(cls_id, f"class_{cls_id}")
-            color = COLORS.get(cls_id, (0, 255, 0))
+            cls_id = int(box.cls[0])
+            boxes_data.append((x1, y1, x2, y2, conf, cls_id))
+    return boxes_data
 
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
 
-            if show_label or show_conf:
-                text_parts = []
-                if show_label:
-                    text_parts.append(label)
-                if show_conf:
-                    text_parts.append(f"{conf:.2f}")
-                text = " ".join(text_parts)
+def draw_filtered_boxes(img, boxes_data, show_label=True, show_conf=True, show_track_id=False):
+    """在图片上绘制滤波后的检测框"""
+    for item in boxes_data:
+        if len(item) == 6:
+            x1, y1, x2, y2, conf, cls_id = item
+            track_id = None
+        else:
+            x1, y1, x2, y2, conf, cls_id, track_id = item
 
-                (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
-                cv2.putText(
-                    img, text, (x1 + 2, y1 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
-                )
+        x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
+        label = CLASS_NAMES.get(cls_id, f"class_{cls_id}")
+        color = COLORS.get(cls_id, (0, 255, 0))
+
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+        text_parts = []
+        if show_track_id and track_id is not None:
+            text_parts.append(f"ID:{track_id}")
+        if show_label:
+            text_parts.append(label)
+        if show_conf:
+            text_parts.append(f"{conf:.2f}")
+        text = " ".join(text_parts)
+
+        if text:
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+            cv2.rectangle(img, (x1, y1 - th - 6), (x1 + tw + 4, y1), color, -1)
+            cv2.putText(
+                img, text, (x1 + 2, y1 - 4),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1,
+            )
     return img
 
 
-def infer_image(model, image_path, output_dir, conf_thres, show):
+def infer_image(model, image_path, output_dir, conf_thres, show, enable_filter):
     """推理单张图片"""
     img_path = Path(image_path)
     if not img_path.exists():
@@ -72,7 +92,15 @@ def infer_image(model, image_path, output_dir, conf_thres, show):
 
     results = model(img_path, conf=conf_thres, iou=0.5)
     img = cv2.imread(str(img_path))
-    img = draw_boxes(img, results)
+
+    if enable_filter:
+        boxes_data = _extract_boxes(results)
+        h, w = img.shape[:2]
+        rf = RuleFilter(h, w)
+        boxes_data = rf.filter_boxes(boxes_data)
+        img = draw_filtered_boxes(img, boxes_data)
+    else:
+        img = draw_filtered_boxes(img, _extract_boxes(results))
 
     output_path = output_dir / img_path.name
     cv2.imwrite(str(output_path), img)
@@ -84,8 +112,10 @@ def infer_image(model, image_path, output_dir, conf_thres, show):
         cv2.destroyAllWindows()
 
 
-def infer_video(model, video_path, output_dir, conf_thres, show):
-    """推理视频文件"""
+def infer_video(model, video_path, output_dir, conf_thres, show,
+                track=False, tracker="botsort.yaml",
+                enable_filter=True, enable_temporal=True):
+    """推理或跟踪视频文件"""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         print(f"[错误] 无法打开视频: {video_path}")
@@ -100,17 +130,39 @@ def infer_video(model, video_path, output_dir, conf_thres, show):
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (w, h))
 
+    # 时序稳定器 (跨帧)
+    stabilizer = TemporalStabilizer() if enable_temporal else None
+
+    mode_str = "跟踪" if track else "推理"
     frame_idx = 0
     print(f"视频信息: {w}x{h}, {fps}fps, {total}帧")
-    print(f"推理中... (按 'q' 退出, 按 's' 暂停)")
+    print(f"{mode_str}中... (按 'q' 退出, 按 's' 暂停)")
+    print(f"  规则过滤: {'开' if enable_filter else '关'} | 时序稳定: {'开' if enable_temporal else '关'}")
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        results = model(frame, conf=conf_thres, iou=0.5)
-        frame = draw_boxes(frame, results)
+        # 原始检测/跟踪
+        if track:
+            results = model.track(frame, conf=conf_thres, iou=0.5, tracker=tracker, persist=True)
+        else:
+            results = model(frame, conf=conf_thres, iou=0.5)
+
+        # 提取boxes
+        raw_boxes = _extract_boxes(results)
+
+        # ── 规则过滤 ──
+        if enable_filter:
+            rf = RuleFilter(h, w)
+            raw_boxes = rf.filter_boxes(raw_boxes)
+
+        # ── 时序稳定 ──
+        if stabilizer is not None:
+            raw_boxes = stabilizer.update(raw_boxes)
+
+        frame = draw_filtered_boxes(frame, raw_boxes)
         writer.write(frame)
 
         if show:
@@ -131,22 +183,42 @@ def infer_video(model, video_path, output_dir, conf_thres, show):
     print(f"结果保存: {output_path}")
 
 
-def infer_webcam(model, conf_thres):
-    """实时摄像头检测"""
+def infer_webcam(model, conf_thres, show, track=False, tracker="botsort.yaml",
+                 enable_filter=True, enable_temporal=True):
+    """实时摄像头检测/跟踪"""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("[错误] 无法打开摄像头")
         return
 
-    print("摄像头实时检测中... (按 'q' 退出)")
+    stabilizer = TemporalStabilizer() if enable_temporal else None
+    mode_str = "跟踪" if track else "检测"
+
+    print(f"摄像头实时{mode_str}中... (按 'q' 退出)")
+    print(f"  规则过滤: {'开' if enable_filter else '关'} | 时序稳定: {'开' if enable_temporal else '关'}")
 
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
 
-        results = model(frame, conf=conf_thres, iou=0.5)
-        frame = draw_boxes(frame, results)
+        h, w = frame.shape[:2]
+
+        if track:
+            results = model.track(frame, conf=conf_thres, iou=0.5, tracker=tracker, persist=True)
+        else:
+            results = model(frame, conf=conf_thres, iou=0.5)
+
+        raw_boxes = _extract_boxes(results)
+
+        if enable_filter:
+            rf = RuleFilter(h, w)
+            raw_boxes = rf.filter_boxes(raw_boxes)
+
+        if stabilizer is not None:
+            raw_boxes = stabilizer.update(raw_boxes)
+
+        frame = draw_filtered_boxes(frame, raw_boxes)
         cv2.imshow("Inference - Press 'q' to quit", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -157,7 +229,7 @@ def infer_webcam(model, conf_thres):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="黑烟白烟检测 - YOLO 推理")
+    parser = argparse.ArgumentParser(description="黑烟白烟检测 - YOLO 推理/跟踪")
     parser.add_argument("source", type=str, nargs="?", default=None,
                         help="推理源: 图片路径/文件夹路径/视频路径/0(摄像头)")
     parser.add_argument("--model", "-m", type=str, default=None,
@@ -168,11 +240,20 @@ def main():
                         help="输出目录 (默认: infer_results)")
     parser.add_argument("--show", "-s", action="store_true",
                         help="显示结果窗口")
+    parser.add_argument("--track", "-t", action="store_true",
+                        help="启用目标跟踪 (仅视频/摄像头)")
+    parser.add_argument("--tracker", type=str, default="botsort.yaml",
+                        help="跟踪器配置: botsort.yaml (默认) 或 bytetrack.yaml")
     parser.add_argument("--no-label", action="store_true",
                         help="不显示类别标签")
     parser.add_argument("--no-conf", action="store_true",
                         help="不显示置信度")
+    parser.add_argument("--no-filter", action="store_true",
+                        help="关闭规则过滤和时序稳定 (原始检测)")
     args = parser.parse_args()
+
+    enable_filter = not args.no_filter
+    enable_temporal = not args.no_filter
 
     model_path = args.model or find_model()
     print(f"加载模型: {model_path}")
@@ -186,26 +267,37 @@ def main():
         print("\n用法示例:")
         print("  python infer.py image.jpg              # 单张图片")
         print("  python infer.py images/                # 图片文件夹")
-        print("  python infer.py video.mp4              # 视频文件")
-        print("  python infer.py 0                      # 摄像头")
+        print("  python infer.py video.mp4              # 推理视频")
+        print("  python infer.py --track video.mp4      # 跟踪视频")
+        print("  python infer.py 0                      # 摄像头检测")
+        print("  python infer.py --track 0              # 摄像头跟踪")
         print("  python infer.py --show image.jpg       # 显示结果")
+        print("  python infer.py --no-filter video.mp4  # 关闭后处理")
         return
 
     print(f"\n推理源: {source}")
     print(f"置信度阈值: {args.conf}")
+    if args.track:
+        print(f"跟踪模式: 启用 (tracker={args.tracker})")
     print()
 
     if source == "0" or source == "camera":
-        infer_webcam(model, args.conf)
+        infer_webcam(model, args.conf, args.show,
+                     track=args.track, tracker=args.tracker,
+                     enable_filter=enable_filter, enable_temporal=enable_temporal)
     elif Path(source).is_dir():
         files = sorted(Path(source).glob("*"))
         for f in files:
             if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp"):
-                infer_image(model, f, output_dir, args.conf, args.show)
+                infer_image(model, f, output_dir, args.conf, args.show,
+                            enable_filter=enable_filter)
     elif Path(source).suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
-        infer_video(model, source, output_dir, args.conf, args.show)
+        infer_video(model, source, output_dir, args.conf, args.show,
+                    track=args.track, tracker=args.tracker,
+                    enable_filter=enable_filter, enable_temporal=enable_temporal)
     else:
-        infer_image(model, source, output_dir, args.conf, args.show)
+        infer_image(model, source, output_dir, args.conf, args.show,
+                    enable_filter=enable_filter)
 
 
 if __name__ == "__main__":

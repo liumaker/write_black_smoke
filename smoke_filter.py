@@ -101,118 +101,156 @@ class RuleFilter:
 
 class ColorCorrector:
     """
-    基于 HSV / LAB 颜色统计的类别修正。
+    基于中心加权 HSV/LAB + 局部背景对比的颜色偏置修正。
     解决：白烟在黑背景上被 YOLO 误判为 blacksmoke，以及
           黑烟在亮背景上被误判为 whitesmoke。
 
-    原理：
-      - 提取检测框内的像素区域
-      - 在 HSV 空间计算亮度（V通道）和饱和度（S通道）
-      - 在 LAB 空间计算 L 通道（感知亮度）
-      - 若框内像素是"亮色"却被归类为 blacksmoke → 修正为 whitesmoke
-      - 若框内像素是"暗色"却被归类为 whitesmoke → 修正为 blacksmoke
+    改进点：
+      1. 中心加权：检测框中心像素权重高（烟雾在中心），边缘低（可能是背景）
+      2. 局部对比：框内 vs 外扩背景环的亮度差异，"白"是相对于周围而言的
     """
 
-    # 白烟像素判据（HSV V > thresh 且 S 不过高 → 是白色/浅色）
-    BRIGHT_V_THRESH = 140       # V通道 > 此值，视为亮像素
-    BRIGHT_S_MAX = 80           # S通道 < 此值，排除高饱和彩色（如火/蓝天）
-    BRIGHT_RATIO_REVERSE = 0.35 # 框内亮像素占比 > 此值 → 判定为"浅色物体"
+    # ── 中心加权 ──
+    CENTER_WEIGHT_SIGMA = 0.5    # 高斯sigma（相对框半径），越小越集中
 
-    # 黑烟像素判据
-    DARK_V_THRESH = 80          # V通道 < 此值，视为暗像素
-    DARK_RATIO_REVERSE = 0.40   # 框内暗像素占比 > 此值 → 判定为"深色物体"
+    # ── 白烟判据 ──
+    BRIGHT_V_THRESH = 140        # HSV V > 此值，视为亮像素
+    BRIGHT_S_MAX = 80            # S < 此值，排除高饱和彩色
+    LAB_L_BRIGHT = 150           # LAB L > 此值，视为亮像素
+    CENTER_BRIGHT_RATIO = 0.30   # 中心加权亮像素占比 > 此值
 
-    # LAB 补充判据（感知亮度，比 HSV-V 更准）
-    LAB_L_BRIGHT = 150          # LAB L > 此值 → 亮像素
+    # ── 黑烟判据 ──
+    DARK_V_THRESH = 80
+    CENTER_DARK_RATIO = 0.35
 
-    # 修正置信度要求：只在置信度不太高时修正（高置信度说明 YOLO 分类可靠）
+    # ── 局部对比判据 ──
+    BG_EXPAND_RATIO = 0.30       # 外扩比例（外扩为背景环）
+    BG_MIN_STRIP = 2             # 背景环最小宽度（像素）
+    LAB_DELTA_BRIGHT = 30        # 框内 L 比背景高这么多 → 相对亮（白烟）
+    LAB_DELTA_DARK = 25          # 框内 L 比背景低这么多 → 相对暗（黑烟）
+
+    # ── 置信度 ──
     CORRECTABLE_CONF_MAX = 0.65
-    OVERRIDE_CONF_MAX = 0.50    # 极端情况强制修正
+    OVERRIDE_CONF_MAX = 0.50
+
+    def _make_center_weights(self, rh: int, rw: int) -> "np.ndarray":
+        """生成 2D 高斯中心权重矩阵，(rh, rw) 形状"""
+        cy, cx = (rh - 1) / 2.0, (rw - 1) / 2.0
+        sy = rh * self.CENTER_WEIGHT_SIGMA
+        sx = rw * self.CENTER_WEIGHT_SIGMA
+        ys = np.arange(rh, dtype=np.float32)
+        xs = np.arange(rw, dtype=np.float32)
+        gy = np.exp(-0.5 * ((ys[:, None] - cy) / sy) ** 2)
+        gx = np.exp(-0.5 * ((xs[None, :] - cx) / sx) ** 2)
+        return gy * gx
 
     def correct(self, boxes_data: list, frame: "np.ndarray") -> list:
-        """
-        对检测结果进行颜色偏置修正。
-
-        Args:
-            boxes_data: [(x1,y1,x2,y2,conf,cls_id), ...]
-            frame:      BGR 图片 (numpy array)
-
-        Returns:
-            修正后的 boxes_data，cls_id 可能被修改
-        """
         if len(boxes_data) == 0:
             return boxes_data
 
         h, w = frame.shape[:2]
+        cv2 = __import__("cv2")
 
-        # 转 HSV 和 LAB
-        hsv = __import__("cv2").cvtColor(frame, __import__("cv2").COLOR_BGR2HSV)
-        lab = __import__("cv2").cvtColor(frame, __import__("cv2").COLOR_BGR2LAB)
+        # 全图转 LAB（L 通道用于全局感知亮度）
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
 
         corrected = []
         for item in boxes_data:
             x1, y1, x2, y2, conf, cls_id = item
 
-            # 坐标取整并约束
+            # 只修正 blacksmoke / whitesmoke
+            if cls_id not in (0, 1):
+                corrected.append(item)
+                continue
+
             ix1 = max(0, int(x1))
             iy1 = max(0, int(y1))
             ix2 = min(w, int(x2))
             iy2 = min(h, int(y2))
-            if ix2 <= ix1 or iy2 <= iy1:
+            box_w = ix2 - ix1
+            box_h = iy2 - iy1
+            if box_w <= 2 or box_h <= 2:
                 corrected.append(item)
                 continue
 
-            # 裁剪 ROI
-            roi_hsv = hsv[iy1:iy2, ix1:ix2]
+            # ── ROI 提取 ──
             roi_lab = lab[iy1:iy2, ix1:ix2]
+            l_channel = roi_lab[:, :, 0].astype(np.float32)
 
-            # ── 统计 ──
-            v_channel = roi_hsv[:, :, 2]        # 亮度
-            s_channel = roi_hsv[:, :, 1]        # 饱和度
-            l_channel = roi_lab[:, :, 0]        # LAB 亮度
+            # ── 1. 中心权重矩阵 ──
+            weights = self._make_center_weights(box_h, box_w)
+            weights /= weights.sum() + 1e-9     # 归一化
 
-            total_pixels = v_channel.size
-            if total_pixels == 0:
-                corrected.append(item)
-                continue
+            # ── 2. 中心加权亮/暗像素占比 ──
+            bright_mask = (l_channel > self.LAB_L_BRIGHT).astype(np.float32)
+            center_bright = (bright_mask * weights).sum()
+            dark_mask = (l_channel < self.DARK_V_THRESH).astype(np.float32)
+            center_dark = (dark_mask * weights).sum()
 
-            # 亮像素：V > BRIGHT_V_THRESH 且 S < BRIGHT_S_MAX
-            bright_mask = (v_channel > self.BRIGHT_V_THRESH) & (s_channel < self.BRIGHT_S_MAX)
-            bright_ratio = bright_mask.sum() / total_pixels
+            # 中心加权平均 L
+            center_mean_l = (l_channel * weights).sum()
 
-            # LAB 亮像素
-            lab_bright_ratio = (l_channel > self.LAB_L_BRIGHT).sum() / total_pixels
+            # ── 3. 局部背景对比 ──
+            # 外扩框 = 背景环（框外 30% 扩展区域）
+            expand_w = max(int(box_w * self.BG_EXPAND_RATIO), self.BG_MIN_STRIP)
+            expand_h = max(int(box_h * self.BG_EXPAND_RATIO), self.BG_MIN_STRIP)
+            bg_x1 = max(0, ix1 - expand_w)
+            bg_y1 = max(0, iy1 - expand_h)
+            bg_x2 = min(w, ix2 + expand_w)
+            bg_y2 = min(h, iy2 + expand_h)
 
-            # 暗像素
-            dark_ratio = (v_channel < self.DARK_V_THRESH).sum() / total_pixels
+            # 背景环区域（外扩框减去内框）
+            bg_region = lab[bg_y1:bg_y2, bg_x1:bg_x2]
+            bg_l = bg_region[:, :, 0].astype(np.float32)
 
-            # 综合亮像素率（HSV + LAB 取高值）
-            effective_bright = max(bright_ratio, lab_bright_ratio)
+            # 在内框对应位置用 mask 排除（只取背景环）
+            inner_rel_x1 = ix1 - bg_x1
+            inner_rel_y1 = iy1 - bg_y1
+            inner_rel_x2 = inner_rel_x1 + box_w
+            inner_rel_y2 = inner_rel_y1 + box_h
+            bg_mask = np.ones(bg_l.shape, dtype=np.float32)
+            if 0 <= inner_rel_y1 < bg_l.shape[0] and 0 <= inner_rel_x1 < bg_l.shape[1]:
+                bg_mask[inner_rel_y1:inner_rel_y2, inner_rel_x1:inner_rel_x2] = 0
 
-            # 平均 V 和 L
-            mean_v = v_channel.mean()
-            mean_l = l_channel.mean()
+            bg_total = bg_mask.sum()
+            if bg_total > 10:
+                bg_mean_l = (bg_l * bg_mask).sum() / bg_total
+            else:
+                # 背景不够大 → 用全图均值回退
+                bg_mean_l = lab[:, :, 0].mean()
 
+            delta_l = center_mean_l - bg_mean_l   # 框内相对背景的亮度差
+
+            # ── 4. 判定 ──
             new_cls_id = cls_id
 
-            # ── 规则1: blacksmoke → whitesmoke 修正 ──
-            # YOLO 分类为 blacksmoke，但框内像素实际上很亮 → 白烟
-            if cls_id == 0:  # blacksmoke
-                if conf < self.CORRECTABLE_CONF_MAX:
-                    if effective_bright > self.BRIGHT_RATIO_REVERSE and mean_l > 140:
-                        new_cls_id = 1  # → whitesmoke
-                    # 极端情况：框内明显是亮色但 YOLO 坚持黑烟
-                    elif conf < self.OVERRIDE_CONF_MAX and effective_bright > 0.55:
-                        new_cls_id = 1
+            # blacksmoke → whitesmoke: 框内相对背景明显亮
+            if cls_id == 0 and conf < self.CORRECTABLE_CONF_MAX:
+                bright_enough = (center_bright > self.CENTER_BRIGHT_RATIO
+                                 and center_mean_l > 140
+                                 and delta_l > self.LAB_DELTA_BRIGHT)
+                bright_override = (conf < self.OVERRIDE_CONF_MAX
+                                   and center_bright > 0.45
+                                   and delta_l > self.LAB_DELTA_BRIGHT)
+                if bright_enough or bright_override:
+                    new_cls_id = 1
 
-            # ── 规则2: whitesmoke → blacksmoke 修正 ──
-            # YOLO 分类为 whitesmoke，但框内像素大部分很暗 → 黑烟
-            if cls_id == 1:  # whitesmoke
-                if conf < self.CORRECTABLE_CONF_MAX:
-                    if dark_ratio > self.DARK_RATIO_REVERSE and mean_v < 100:
-                        new_cls_id = 0  # → blacksmoke
-                    elif conf < self.OVERRIDE_CONF_MAX and dark_ratio > 0.55:
-                        new_cls_id = 0
+            # whitesmoke → blacksmoke: 框内相对背景明显暗
+            if cls_id == 1 and conf < self.CORRECTABLE_CONF_MAX:
+                dark_enough = (center_dark > self.CENTER_DARK_RATIO
+                               and center_mean_l < 115
+                               and delta_l < -self.LAB_DELTA_DARK)
+                dark_override = (conf < self.OVERRIDE_CONF_MAX
+                                 and center_dark > 0.50
+                                 and delta_l < -self.LAB_DELTA_DARK)
+                if dark_enough or dark_override:
+                    new_cls_id = 0
+
+            # ── 5. 安全网：极端对比 + 极低置信度 → 无条件修正 ──
+            if cls_id == 0 and conf < 0.35 and delta_l > 60:
+                new_cls_id = 1
+            if cls_id == 1 and conf < 0.35 and delta_l < -50:
+                new_cls_id = 0
 
             if new_cls_id != cls_id:
                 corrected.append((x1, y1, x2, y2, conf, new_cls_id))

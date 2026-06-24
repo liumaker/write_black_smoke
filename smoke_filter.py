@@ -96,6 +96,133 @@ class RuleFilter:
 
 
 # ─────────────────────────────────────────────
+#  颜色偏置修正模块  (HSV/LAB 统计纠正背景色带偏)
+# ─────────────────────────────────────────────
+
+class ColorCorrector:
+    """
+    基于 HSV / LAB 颜色统计的类别修正。
+    解决：白烟在黑背景上被 YOLO 误判为 blacksmoke，以及
+          黑烟在亮背景上被误判为 whitesmoke。
+
+    原理：
+      - 提取检测框内的像素区域
+      - 在 HSV 空间计算亮度（V通道）和饱和度（S通道）
+      - 在 LAB 空间计算 L 通道（感知亮度）
+      - 若框内像素是"亮色"却被归类为 blacksmoke → 修正为 whitesmoke
+      - 若框内像素是"暗色"却被归类为 whitesmoke → 修正为 blacksmoke
+    """
+
+    # 白烟像素判据（HSV V > thresh 且 S 不过高 → 是白色/浅色）
+    BRIGHT_V_THRESH = 140       # V通道 > 此值，视为亮像素
+    BRIGHT_S_MAX = 80           # S通道 < 此值，排除高饱和彩色（如火/蓝天）
+    BRIGHT_RATIO_REVERSE = 0.35 # 框内亮像素占比 > 此值 → 判定为"浅色物体"
+
+    # 黑烟像素判据
+    DARK_V_THRESH = 80          # V通道 < 此值，视为暗像素
+    DARK_RATIO_REVERSE = 0.40   # 框内暗像素占比 > 此值 → 判定为"深色物体"
+
+    # LAB 补充判据（感知亮度，比 HSV-V 更准）
+    LAB_L_BRIGHT = 150          # LAB L > 此值 → 亮像素
+
+    # 修正置信度要求：只在置信度不太高时修正（高置信度说明 YOLO 分类可靠）
+    CORRECTABLE_CONF_MAX = 0.65
+    OVERRIDE_CONF_MAX = 0.50    # 极端情况强制修正
+
+    def correct(self, boxes_data: list, frame: "np.ndarray") -> list:
+        """
+        对检测结果进行颜色偏置修正。
+
+        Args:
+            boxes_data: [(x1,y1,x2,y2,conf,cls_id), ...]
+            frame:      BGR 图片 (numpy array)
+
+        Returns:
+            修正后的 boxes_data，cls_id 可能被修改
+        """
+        if len(boxes_data) == 0:
+            return boxes_data
+
+        h, w = frame.shape[:2]
+
+        # 转 HSV 和 LAB
+        hsv = __import__("cv2").cvtColor(frame, __import__("cv2").COLOR_BGR2HSV)
+        lab = __import__("cv2").cvtColor(frame, __import__("cv2").COLOR_BGR2LAB)
+
+        corrected = []
+        for item in boxes_data:
+            x1, y1, x2, y2, conf, cls_id = item
+
+            # 坐标取整并约束
+            ix1 = max(0, int(x1))
+            iy1 = max(0, int(y1))
+            ix2 = min(w, int(x2))
+            iy2 = min(h, int(y2))
+            if ix2 <= ix1 or iy2 <= iy1:
+                corrected.append(item)
+                continue
+
+            # 裁剪 ROI
+            roi_hsv = hsv[iy1:iy2, ix1:ix2]
+            roi_lab = lab[iy1:iy2, ix1:ix2]
+
+            # ── 统计 ──
+            v_channel = roi_hsv[:, :, 2]        # 亮度
+            s_channel = roi_hsv[:, :, 1]        # 饱和度
+            l_channel = roi_lab[:, :, 0]        # LAB 亮度
+
+            total_pixels = v_channel.size
+            if total_pixels == 0:
+                corrected.append(item)
+                continue
+
+            # 亮像素：V > BRIGHT_V_THRESH 且 S < BRIGHT_S_MAX
+            bright_mask = (v_channel > self.BRIGHT_V_THRESH) & (s_channel < self.BRIGHT_S_MAX)
+            bright_ratio = bright_mask.sum() / total_pixels
+
+            # LAB 亮像素
+            lab_bright_ratio = (l_channel > self.LAB_L_BRIGHT).sum() / total_pixels
+
+            # 暗像素
+            dark_ratio = (v_channel < self.DARK_V_THRESH).sum() / total_pixels
+
+            # 综合亮像素率（HSV + LAB 取高值）
+            effective_bright = max(bright_ratio, lab_bright_ratio)
+
+            # 平均 V 和 L
+            mean_v = v_channel.mean()
+            mean_l = l_channel.mean()
+
+            new_cls_id = cls_id
+
+            # ── 规则1: blacksmoke → whitesmoke 修正 ──
+            # YOLO 分类为 blacksmoke，但框内像素实际上很亮 → 白烟
+            if cls_id == 0:  # blacksmoke
+                if conf < self.CORRECTABLE_CONF_MAX:
+                    if effective_bright > self.BRIGHT_RATIO_REVERSE and mean_l > 140:
+                        new_cls_id = 1  # → whitesmoke
+                    # 极端情况：框内明显是亮色但 YOLO 坚持黑烟
+                    elif conf < self.OVERRIDE_CONF_MAX and effective_bright > 0.55:
+                        new_cls_id = 1
+
+            # ── 规则2: whitesmoke → blacksmoke 修正 ──
+            # YOLO 分类为 whitesmoke，但框内像素大部分很暗 → 黑烟
+            if cls_id == 1:  # whitesmoke
+                if conf < self.CORRECTABLE_CONF_MAX:
+                    if dark_ratio > self.DARK_RATIO_REVERSE and mean_v < 100:
+                        new_cls_id = 0  # → blacksmoke
+                    elif conf < self.OVERRIDE_CONF_MAX and dark_ratio > 0.55:
+                        new_cls_id = 0
+
+            if new_cls_id != cls_id:
+                corrected.append((x1, y1, x2, y2, conf, new_cls_id))
+            else:
+                corrected.append(item)
+
+        return corrected
+
+
+# ─────────────────────────────────────────────
 #  时序稳定模块  (防闪烁 / 去瞬时误检 / 提高报警可靠性)
 # ─────────────────────────────────────────────
 

@@ -12,7 +12,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from smoke_filter import RuleFilter, TemporalStabilizer
+from smoke_filter import RuleFilter, TemporalStabilizer, ColorCorrector
 
 # 类别配置 (与训练时保持一致)
 CLASS_NAMES = {0: "blacksmoke", 1: "whitesmoke", 2: "fire", 3: "smoke"}
@@ -31,17 +31,10 @@ def find_model():
     candidates = []
     for sp in search_paths:
         candidates.extend(list(Path(sp).rglob("weights/best.pt")))
-    # 直接检查常见权重路径
-    for direct_path in ["./runs/detect/train/weights/best.pt",
-                        "runs/detect/train/weights/best.pt"]:
-        p = Path(direct_path)
-        if p.exists():
-            candidates.append(str(p.resolve()))
     if not candidates:
         print("[错误] 未找到模型文件")
         print("  搜索路径: runs/train/ 和 runs/detect/train/")
-        print("  以及: ./runs/detect/train/weights/best.pt")
-        print("请先运行 train.py 训练模型或使用 --model 指定路径")
+        print("请先运行 train.py 训练模型")
         sys.exit(1)
     return str(sorted(candidates)[-1])
 
@@ -135,7 +128,8 @@ def draw_filtered_boxes(img, boxes_data, show_label=True, show_conf=True,
     return img
 
 
-def infer_image(model, image_path, output_dir, model_conf, show, enable_filter, cls_conf=None):
+def infer_image(model, image_path, output_dir, model_conf, show, enable_filter,
+               enable_color=True, cls_conf=None):
     """推理单张图片"""
     img_path = Path(image_path)
     if not img_path.exists():
@@ -154,6 +148,11 @@ def infer_image(model, image_path, output_dir, model_conf, show, enable_filter, 
         rf = RuleFilter(h, w)
         boxes_data = rf.filter_boxes(boxes_data)
 
+    # 颜色偏置修正
+    if enable_color:
+        cc = ColorCorrector()
+        boxes_data = cc.correct(boxes_data, img)
+
     img = draw_filtered_boxes(img, boxes_data)
 
     output_path = output_dir / img_path.name
@@ -169,7 +168,7 @@ def infer_image(model, image_path, output_dir, model_conf, show, enable_filter, 
 def infer_video(model, video_path, output_dir, model_conf, show,
                 track=False, tracker="botsort.yaml",
                 enable_filter=True, enable_temporal=True,
-                show_reliability=False, cls_conf=None):
+                enable_color=True, show_reliability=False, cls_conf=None):
     """推理或跟踪视频文件"""
     video_path = Path(video_path)
     cap = cv2.VideoCapture(str(video_path))
@@ -188,12 +187,14 @@ def infer_video(model, video_path, output_dir, model_conf, show,
 
     # 时序稳定器 (跨帧)
     stabilizer = TemporalStabilizer() if enable_temporal else None
+    # 颜色修正器
+    color_corrector = ColorCorrector() if enable_color else None
 
     mode_str = "跟踪" if track else "推理"
     frame_idx = 0
     print(f"视频信息: {w}x{h}, {fps}fps, {total}帧")
     print(f"{mode_str}中... (按 'q' 退出, 按 's' 暂停)")
-    print(f"  规则过滤: {'开' if enable_filter else '关'} | 时序稳定: {'开' if enable_temporal else '关'}")
+    print(f"  规则过滤: {'开' if enable_filter else '关'} | 颜色修正: {'开' if enable_color else '关'} | 时序稳定: {'开' if enable_temporal else '关'}")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -217,6 +218,10 @@ def infer_video(model, video_path, output_dir, model_conf, show,
         if enable_filter:
             rf = RuleFilter(h, w)
             raw_boxes = rf.filter_boxes(raw_boxes)
+
+        # ── 颜色偏置修正 ──
+        if color_corrector is not None:
+            raw_boxes = color_corrector.correct(raw_boxes, frame)
 
         # ── 时序稳定 ──
         if stabilizer is not None:
@@ -244,8 +249,8 @@ def infer_video(model, video_path, output_dir, model_conf, show,
 
 
 def infer_webcam(model, model_conf, show, track=False, tracker="botsort.yaml",
-                 enable_filter=True, enable_temporal=True, show_reliability=False,
-                 cls_conf=None):
+                 enable_filter=True, enable_temporal=True, enable_color=True,
+                 show_reliability=False, cls_conf=None):
     """实时摄像头检测/跟踪"""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -253,10 +258,11 @@ def infer_webcam(model, model_conf, show, track=False, tracker="botsort.yaml",
         return
 
     stabilizer = TemporalStabilizer() if enable_temporal else None
+    color_corrector = ColorCorrector() if enable_color else None
     mode_str = "跟踪" if track else "检测"
 
     print(f"摄像头实时{mode_str}中... (按 'q' 退出)")
-    print(f"  规则过滤: {'开' if enable_filter else '关'} | 时序稳定: {'开' if enable_temporal else '关'}")
+    print(f"  规则过滤: {'开' if enable_filter else '关'} | 颜色修正: {'开' if enable_color else '关'} | 时序稳定: {'开' if enable_temporal else '关'}")
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -278,6 +284,9 @@ def infer_webcam(model, model_conf, show, track=False, tracker="botsort.yaml",
         if enable_filter:
             rf = RuleFilter(h, w)
             raw_boxes = rf.filter_boxes(raw_boxes)
+
+        if color_corrector is not None:
+            raw_boxes = color_corrector.correct(raw_boxes, frame)
 
         if stabilizer is not None:
             raw_boxes = stabilizer.update(raw_boxes)
@@ -314,6 +323,8 @@ def main():
                         help="不显示置信度")
     parser.add_argument("--no-filter", action="store_true",
                         help="关闭规则过滤和时序稳定 (原始检测)")
+    parser.add_argument("--no-color", action="store_true",
+                        help="关闭颜色偏置修正")
     parser.add_argument("--show-reliability", action="store_true",
                         help="显示时序可靠性评分 (框下方)")
     parser.add_argument("--cls-conf", type=str, default=None,
@@ -322,6 +333,7 @@ def main():
 
     enable_filter = not args.no_filter
     enable_temporal = not args.no_filter
+    enable_color = not args.no_color
     show_reliability = args.show_reliability
 
     # 解析按类别阈值
@@ -368,21 +380,25 @@ def main():
         infer_webcam(model, model_conf, args.show,
                      track=args.track, tracker=args.tracker,
                      enable_filter=enable_filter, enable_temporal=enable_temporal,
+                     enable_color=enable_color,
                      show_reliability=show_reliability, cls_conf=cls_conf)
     elif Path(source).is_dir():
         files = sorted(Path(source).glob("*"))
         for f in files:
             if f.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp"):
                 infer_image(model, f, output_dir, model_conf, args.show,
-                            enable_filter=enable_filter, cls_conf=cls_conf)
+                            enable_filter=enable_filter,
+                            enable_color=enable_color, cls_conf=cls_conf)
     elif Path(source).suffix.lower() in (".mp4", ".avi", ".mov", ".mkv"):
         infer_video(model, source, output_dir, model_conf, args.show,
                     track=args.track, tracker=args.tracker,
                     enable_filter=enable_filter, enable_temporal=enable_temporal,
+                    enable_color=enable_color,
                     show_reliability=show_reliability, cls_conf=cls_conf)
     else:
         infer_image(model, source, output_dir, model_conf, args.show,
-                    enable_filter=enable_filter, cls_conf=cls_conf)
+                    enable_filter=enable_filter,
+                    enable_color=enable_color, cls_conf=cls_conf)
 
 
 if __name__ == "__main__":

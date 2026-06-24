@@ -9,12 +9,15 @@ from ultralytics import YOLO
 
 def find_best_model():
     """在 YOLO 默认输出路径下寻找最佳模型"""
-    candidates = list(Path("runs/train").rglob("weights/best.pt"))
+    search_paths = ["runs/train", "runs/detect/train"]
+    candidates = []
+    for sp in search_paths:
+        candidates.extend(list(Path(sp).rglob("weights/best.pt")))
     if not candidates:
-        print("[错误] 未找到训练好的模型 (runs/train/**/weights/best.pt)")
+        print("[错误] 未找到训练好的模型")
+        print("  搜索路径: runs/train/ 和 runs/detect/train/")
         print("请先运行 train.py 训练模型")
         return None
-    # 取最新的模型
     return str(sorted(candidates)[-1])
 
 

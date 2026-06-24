@@ -327,8 +327,8 @@ def main():
                         help="关闭颜色偏置修正")
     parser.add_argument("--show-reliability", action="store_true",
                         help="显示时序可靠性评分 (框下方)")
-    parser.add_argument("--cls-conf", type=str, default=None,
-                        help="按类别设置独立置信度阈值，逗号分隔，如 0.25,0.15,0.25,0.25")
+    parser.add_argument("--cls-conf", type=str, default="0.25,0.15,0.25,0.25",
+                        help="按类别设置独立置信度阈值 (blacksmoke,whitesmoke,fire,smoke)")
     args = parser.parse_args()
 
     enable_filter = not args.no_filter

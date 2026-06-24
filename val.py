@@ -13,10 +13,17 @@ def find_best_model():
     candidates = []
     for sp in search_paths:
         candidates.extend(list(Path(sp).rglob("weights/best.pt")))
+    # 直接检查常见权重路径
+    for direct_path in ["./runs/detect/train/weights/best.pt",
+                        "runs/detect/train/weights/best.pt"]:
+        p = Path(direct_path)
+        if p.exists():
+            candidates.append(str(p.resolve()))
     if not candidates:
         print("[错误] 未找到训练好的模型")
         print("  搜索路径: runs/train/ 和 runs/detect/train/")
-        print("请先运行 train.py 训练模型")
+        print("  以及: ./runs/detect/train/weights/best.pt")
+        print("请先运行 train.py 训练模型或使用 --model 指定路径")
         return None
     return str(sorted(candidates)[-1])
 
